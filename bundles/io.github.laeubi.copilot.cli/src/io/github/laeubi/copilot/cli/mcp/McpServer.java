@@ -12,12 +12,11 @@
 package io.github.laeubi.copilot.cli.mcp;
 
 import java.io.BufferedReader;
+import java.io.Closeable;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
-import java.net.InetAddress;
-import java.net.InetSocketAddress;
 import java.net.StandardProtocolFamily;
 import java.net.UnixDomainSocketAddress;
 import java.nio.channels.Channels;
@@ -32,8 +31,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.ExecutorService;
-import java.util.concurrent.Executors;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
@@ -45,10 +42,8 @@ import org.eclipse.core.runtime.ILog;
  * initialization, and SSE push notifications.
  * <p>
  * On non-Windows platforms the server listens on a Unix domain socket. On
- * Windows it falls back to TCP on the loopback interface because Node.js
- * (used by Copilot CLI) does not support native AF_UNIX sockets on Windows
- * — it uses Named Pipes instead — which are incompatible with Java's
- * {@link ServerSocketChannel}/{@link StandardProtocolFamily#UNIX}.
+ * Windows it listens on a named pipe, which is what Node.js (used by Copilot
+ * CLI) connects to there; see {@link NamedPipe}.
  */
 public class McpServer {
 
@@ -56,15 +51,30 @@ public class McpServer {
 	private static final String SERVER_NAME = "vscode-copilot-cli";
 	private static final String SERVER_VERSION = "1.0.0";
 
+	/** A connected client: a socket or a named pipe instance. */
+	interface Connection extends Closeable {
+		InputStream in() throws IOException;
+
+		OutputStream out() throws IOException;
+
+		boolean isOpen();
+	}
+
+	private interface Listener {
+		Connection accept() throws IOException;
+
+		void close();
+	}
+
 	private final String nonce;
 	private final Path socketPath;
+	private final String pipeName;
 	private final McpToolHandler toolHandler;
-	private final ExecutorService executor;
 	private final AtomicBoolean running = new AtomicBoolean(false);
 	private final CopyOnWriteArrayList<SseClient> sseClients = new CopyOnWriteArrayList<>();
 	private final AtomicLong connectionCounter = new AtomicLong(0);
 
-	private ServerSocketChannel serverChannel;
+	private Listener listener;
 
 	/**
 	 * Create a server that listens on a Unix domain socket.
@@ -75,48 +85,49 @@ public class McpServer {
 	 */
 	public McpServer(Path socketPath, String nonce, McpToolHandler toolHandler) {
 		this.socketPath = socketPath;
+		this.pipeName = null;
 		this.nonce = nonce;
 		this.toolHandler = toolHandler;
-		this.executor = Executors.newVirtualThreadPerTaskExecutor();
 	}
 
 	/**
-	 * Create a server that listens on TCP loopback (for Windows).
+	 * Create a server that listens on a Windows named pipe.
 	 *
+	 * @param pipeName    full pipe name, e.g. {@code \\.\pipe\name}
 	 * @param nonce       authentication nonce
 	 * @param toolHandler tool handler for MCP tool calls
 	 */
-	public McpServer(String nonce, McpToolHandler toolHandler) {
+	public McpServer(String pipeName, String nonce, McpToolHandler toolHandler) {
 		this.socketPath = null;
+		this.pipeName = pipeName;
 		this.nonce = nonce;
 		this.toolHandler = toolHandler;
-		this.executor = Executors.newVirtualThreadPerTaskExecutor();
 	}
 
 	public void start() throws IOException {
 		if (!running.compareAndSet(false, true)) {
 			return;
 		}
-		if (socketPath != null) {
-			// Unix domain socket (Linux, macOS)
-			Files.deleteIfExists(socketPath);
-			serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
-			serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
-			ILog.get().info("[MCP] Server listening on Unix socket " + socketPath);
+		if (pipeName != null) {
+			listener = pipeListener(new NamedPipe(pipeName));
+			ILog.get().info("[MCP] Server listening on named pipe " + pipeName);
 		} else {
-			// TCP loopback (Windows fallback)
-			serverChannel = ServerSocketChannel.open();
-			serverChannel.bind(new InetSocketAddress(InetAddress.getLoopbackAddress(), 0));
-			ILog.get().info("[MCP] Server listening on TCP " + serverChannel.getLocalAddress());
+			Files.deleteIfExists(socketPath);
+			ServerSocketChannel serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
+			serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
+			listener = socketListener(serverChannel);
+			ILog.get().info("[MCP] Server listening on Unix socket " + socketPath);
 		}
 
-		executor.submit(() -> {
+		// Platform threads: blocking native pipe calls would pin virtual threads.
+		Thread.ofPlatform().daemon().name("MCP accept").start(() -> {
 			while (running.get()) {
 				try {
-					SocketChannel client = serverChannel.accept();
+					Connection client = listener.accept();
 					long connId = connectionCounter.incrementAndGet();
 					ILog.get().info("[MCP] Connection #" + connId + " accepted");
-					executor.submit(() -> handleConnection(client, connId));
+					Thread.ofPlatform().daemon().name("MCP #" + connId)
+							.start(() -> handleConnection(client, connId));
 				} catch (IOException e) {
 					if (running.get()) {
 						ILog.get().error("[MCP] Error accepting connection: " + e.getMessage(), e);
@@ -135,12 +146,8 @@ public class McpServer {
 			client.close();
 		}
 		sseClients.clear();
-		try {
-			if (serverChannel != null) {
-				serverChannel.close();
-			}
-		} catch (IOException e) {
-			// ignore on shutdown
+		if (listener != null) {
+			listener.close();
 		}
 		try {
 			if (socketPath != null) {
@@ -149,7 +156,6 @@ public class McpServer {
 		} catch (IOException e) {
 			// ignore
 		}
-		executor.shutdownNow();
 		ILog.get().info("[MCP] Server stopped");
 	}
 
@@ -157,19 +163,57 @@ public class McpServer {
 		return running.get();
 	}
 
-	/**
-	 * Returns the TCP port the server is listening on, or {@code -1} if the
-	 * server uses a Unix domain socket.
-	 */
-	public int getLocalPort() {
-		if (socketPath != null || serverChannel == null) {
-			return -1;
-		}
-		try {
-			return ((InetSocketAddress) serverChannel.getLocalAddress()).getPort();
-		} catch (IOException e) {
-			return -1;
-		}
+	private static Listener pipeListener(NamedPipe pipe) {
+		return new Listener() {
+			@Override
+			public Connection accept() throws IOException {
+				return pipe.accept();
+			}
+
+			@Override
+			public void close() {
+				pipe.close();
+			}
+		};
+	}
+
+	private static Listener socketListener(ServerSocketChannel serverChannel) {
+		return new Listener() {
+			@Override
+			public Connection accept() throws IOException {
+				SocketChannel channel = serverChannel.accept();
+				return new Connection() {
+					@Override
+					public InputStream in() {
+						return Channels.newInputStream(channel);
+					}
+
+					@Override
+					public OutputStream out() {
+						return Channels.newOutputStream(channel);
+					}
+
+					@Override
+					public boolean isOpen() {
+						return channel.isOpen();
+					}
+
+					@Override
+					public void close() throws IOException {
+						channel.close();
+					}
+				};
+			}
+
+			@Override
+			public void close() {
+				try {
+					serverChannel.close();
+				} catch (IOException e) {
+					// ignore on shutdown
+				}
+			}
+		};
 	}
 
 	/**
@@ -198,12 +242,12 @@ public class McpServer {
 
 	// --- Connection handling ---
 
-	private void handleConnection(SocketChannel channel, long connId) {
+	private void handleConnection(Connection channel, long connId) {
 		String prefix = "[MCP #" + connId + "]";
 		int requestCount = 0;
 		try (channel;
-				InputStream is = Channels.newInputStream(channel);
-				OutputStream os = Channels.newOutputStream(channel)) {
+				InputStream is = channel.in();
+				OutputStream os = channel.out()) {
 			BufferedReader reader = new BufferedReader(new InputStreamReader(is, StandardCharsets.UTF_8));
 
 			// HTTP persistent connection loop: handle multiple requests per connection
@@ -365,7 +409,7 @@ public class McpServer {
 		sendSseResponse(os, 200, sessionId, ssePayload, prefix);
 	}
 
-	private void handleGet(Map<String, String> headers, OutputStream os, SocketChannel channel, String prefix)
+	private void handleGet(Map<String, String> headers, OutputStream os, Connection channel, String prefix)
 			throws IOException {
 		String sessionId = headers.get("mcp-session-id");
 		if (sessionId == null) {
@@ -648,11 +692,11 @@ public class McpServer {
 
 	static class SseClient {
 		private final OutputStream os;
-		private final SocketChannel channel;
+		private final Connection channel;
 		private final String prefix;
 		private volatile boolean alive = true;
 
-		SseClient(OutputStream os, SocketChannel channel, String prefix) {
+		SseClient(OutputStream os, Connection channel, String prefix) {
 			this.os = os;
 			this.channel = channel;
 			this.prefix = prefix;

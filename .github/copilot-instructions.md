@@ -71,7 +71,7 @@ The embedded MCP server implements the [Copilot CLI `/ide` protocol](https://git
 
 ## Conventions
 
-- **Java 21** language level. The bundle requires `JavaSE-21` execution environment.
+- **Java 22** language level (the Windows named pipe uses the Foreign Function & Memory API). The bundle requires `JavaSE-22` execution environment.
 - **No external dependencies** — the plugin depends only on Eclipse platform bundles (`org.eclipse.ui`, `org.eclipse.core.*`, `org.eclipse.terminal.*`, `org.eclipse.jface.text`, `org.eclipse.compare`, `org.eclipse.debug.core`, `org.eclipse.debug.ui`, `org.eclipse.ui.console`, `org.eclipse.cdt.utils.pty`). JSON handling uses a built-in minimal parser.
 - OSGi metadata lives in `META-INF/MANIFEST.MF` (not generated from pom.xml). The `plugin.xml` declares all extension points. Both files must be kept in sync with Java code changes.
 - The `copilot` command name is hardcoded in `CopilotCliConnector`. The plugin assumes the CLI is on the system PATH.
