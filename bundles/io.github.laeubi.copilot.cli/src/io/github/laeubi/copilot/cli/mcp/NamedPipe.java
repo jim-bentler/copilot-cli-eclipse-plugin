@@ -25,7 +25,6 @@ import java.lang.foreign.SymbolLookup;
 import java.lang.invoke.MethodHandle;
 import java.lang.invoke.VarHandle;
 import java.nio.charset.StandardCharsets;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Windows named pipe server built on the Foreign Function &amp; Memory API.
@@ -93,7 +92,7 @@ final class NamedPipe {
 
 	private final String name;
 	private boolean open = true;
-	private MemorySegment pending;
+	private PipeHandle pending;
 
 	NamedPipe(String name) throws IOException {
 		this.name = name;
@@ -110,36 +109,57 @@ final class NamedPipe {
 	 * between clients.
 	 */
 	McpServer.Connection accept() throws IOException {
-		MemorySegment handle;
+		PipeHandle handle;
 		synchronized (this) {
 			if (!open) {
 				throw new IOException("Pipe closed");
+			}
+			if (pending == null) {
+				pending = createInstance();
 			}
 			handle = pending;
 		}
-		int result = overlapped(handle, (state, ov) -> (int) CONNECT_NAMED_PIPE.invokeExact(state, handle, ov));
-		synchronized (this) {
-			if (!open) {
-				throw new IOException("Pipe closed");
-			}
-			pending = createInstance();
+		boolean transferred = false;
+		try {
+			int result = overlapped(handle,
+					(state, ov) -> (int) CONNECT_NAMED_PIPE.invokeExact(state, handle.value, ov));
 			if (result < 0 && result != -ERROR_PIPE_CONNECTED) {
-				closeHandle(handle);
 				throw new IOException("ConnectNamedPipe failed: " + -result);
 			}
+			synchronized (this) {
+				if (!open) {
+					throw new IOException("Pipe closed");
+				}
+				pending = null;
+				pending = createInstance();
+				McpServer.Connection connection = new PipeConnection(handle);
+				transferred = true;
+				return connection;
+			}
+		} finally {
+			if (!transferred) {
+				synchronized (this) {
+					if (pending == handle) {
+						pending = null;
+					}
+				}
+				handle.close();
+			}
 		}
-		return new PipeConnection(handle);
 	}
 
 	/** Stops accepting, releasing a blocked {@link #accept()}. */
 	synchronized void close() {
 		if (open) {
 			open = false;
-			cancelAndClose(pending);
+			if (pending != null) {
+				pending.close();
+				pending = null;
+			}
 		}
 	}
 
-	private MemorySegment createInstance() throws IOException {
+	private PipeHandle createInstance() throws IOException {
 		try (Arena arena = Arena.ofConfined()) {
 			MemorySegment state = arena.allocate(CALL_STATE);
 			MemorySegment handle = (MemorySegment) CREATE_NAMED_PIPE.invokeExact(state, wide(arena, name),
@@ -148,7 +168,16 @@ final class NamedPipe {
 			if (handle.equals(INVALID_HANDLE_VALUE)) {
 				throw new IOException("CreateNamedPipeW failed for " + name + ": " + lastError(state));
 			}
-			return handle;
+			boolean transferred = false;
+			try {
+				PipeHandle owner = new PipeHandle(handle);
+				transferred = true;
+				return owner;
+			} finally {
+				if (!transferred) {
+					closeHandle(handle);
+				}
+			}
 		} catch (IOException e) {
 			throw e;
 		} catch (Throwable t) {
@@ -166,7 +195,7 @@ final class NamedPipe {
 	 *
 	 * @return the number of bytes transferred, or the negated Win32 error code
 	 */
-	private static int overlapped(MemorySegment handle, Start start) throws IOException {
+	private static int overlapped(PipeHandle handle, Start start) throws IOException {
 		try (Arena arena = Arena.ofConfined()) {
 			MemorySegment state = arena.allocate(CALL_STATE);
 			MemorySegment event = (MemorySegment) CREATE_EVENT.invokeExact(state, MemorySegment.NULL, 1, 0,
@@ -177,14 +206,30 @@ final class NamedPipe {
 			try {
 				MemorySegment ov = arena.allocate(OVERLAPPED_SIZE, 8);
 				ov.set(ADDRESS, OVERLAPPED_EVENT, event);
-				if (start.call(state, ov) == 0 && lastError(state) != ERROR_IO_PENDING) {
-					return -lastError(state);
-				}
 				MemorySegment count = arena.allocate(JAVA_INT);
-				if ((int) GET_OVERLAPPED_RESULT.invokeExact(state, handle, ov, count, 1) == 0) {
-					return -lastError(state);
+				synchronized (handle) {
+					if (!handle.open) {
+						throw new IOException("Pipe closed");
+					}
+					handle.operations++;
 				}
-				return count.get(JAVA_INT, 0);
+				try {
+					synchronized (handle) {
+						if (!handle.open) {
+							throw new IOException("Pipe closed");
+						}
+						// Issue under the close lock so cancellation cannot miss this operation.
+						if (start.call(state, ov) == 0 && lastError(state) != ERROR_IO_PENDING) {
+							return -lastError(state);
+						}
+					}
+					if ((int) GET_OVERLAPPED_RESULT.invokeExact(state, handle.value, ov, count, 1) == 0) {
+						return -lastError(state);
+					}
+					return count.get(JAVA_INT, 0);
+				} finally {
+					handle.finished();
+				}
 			} finally {
 				closeHandle(event);
 			}
@@ -203,18 +248,41 @@ final class NamedPipe {
 		return (int) LAST_ERROR.get(state, 0L);
 	}
 
-	/**
-	 * Cancels pending I/O so blocked threads return, then closes the handle.
-	 * Unlike {@code DisconnectNamedPipe}, the client can still read what was
-	 * already written.
-	 */
-	private static void cancelAndClose(MemorySegment handle) {
-		try {
-			int ignored = (int) CANCEL_IO_EX.invokeExact(handle, MemorySegment.NULL);
-		} catch (Throwable t) {
-			// ignore on close
+	private static final class PipeHandle {
+		private final MemorySegment value;
+		private boolean open = true;
+		private int operations;
+
+		PipeHandle(MemorySegment value) {
+			this.value = value;
 		}
-		closeHandle(handle);
+
+		synchronized boolean isOpen() {
+			return open;
+		}
+
+		synchronized void close() {
+			if (!open) {
+				return;
+			}
+			open = false;
+			if (operations == 0) {
+				closeHandle(value);
+			} else {
+				try {
+					int ignored = (int) CANCEL_IO_EX.invokeExact(value, MemorySegment.NULL);
+				} catch (Throwable t) {
+					throw new IllegalStateException("CancelIoEx invocation failed", t);
+				}
+			}
+		}
+
+		synchronized void finished() {
+			if (--operations == 0 && !open) {
+				// Cancellation is only a request: retain the handle until every waiter completes.
+				closeHandle(value);
+			}
+		}
 	}
 
 	private static void closeHandle(MemorySegment handle) {
@@ -227,12 +295,11 @@ final class NamedPipe {
 
 	private static final class PipeConnection implements McpServer.Connection {
 
-		private final MemorySegment handle;
-		private final AtomicBoolean open = new AtomicBoolean(true);
+		private final PipeHandle handle;
 		private final InputStream in = new PipeInputStream();
 		private final OutputStream out = new PipeOutputStream();
 
-		PipeConnection(MemorySegment handle) {
+		PipeConnection(PipeHandle handle) {
 			this.handle = handle;
 		}
 
@@ -248,14 +315,12 @@ final class NamedPipe {
 
 		@Override
 		public boolean isOpen() {
-			return open.get();
+			return handle.isOpen();
 		}
 
 		@Override
 		public void close() {
-			if (open.compareAndSet(true, false)) {
-				cancelAndClose(handle);
-			}
+			handle.close();
 		}
 
 		private final class PipeInputStream extends InputStream {
@@ -270,18 +335,18 @@ final class NamedPipe {
 				if (len == 0) {
 					return 0;
 				}
-				if (!open.get()) {
+				if (!isOpen()) {
 					return -1;
 				}
 				try (Arena arena = Arena.ofConfined()) {
 					MemorySegment buffer = arena.allocate(Math.min(len, BUFFER_SIZE));
 					int size = (int) buffer.byteSize();
-					int n = overlapped(handle, (state, ov) -> (int) READ_FILE.invokeExact(state, handle, buffer, size,
+					int n = overlapped(handle, (state, ov) -> (int) READ_FILE.invokeExact(state, handle.value, buffer, size,
 							MemorySegment.NULL, ov));
 					if (n < 0) {
 						int error = -n;
 						if (error == ERROR_BROKEN_PIPE || error == ERROR_PIPE_NOT_CONNECTED
-								|| error == ERROR_OPERATION_ABORTED || !open.get()) {
+								|| error == ERROR_OPERATION_ABORTED || !isOpen()) {
 							return -1;
 						}
 						throw new IOException("ReadFile failed: " + error);
@@ -303,7 +368,7 @@ final class NamedPipe {
 
 			@Override
 			public synchronized void write(byte[] b, int off, int len) throws IOException {
-				if (!open.get()) {
+				if (!isOpen()) {
 					throw new IOException("Pipe closed");
 				}
 				try (Arena arena = Arena.ofConfined()) {
@@ -313,14 +378,16 @@ final class NamedPipe {
 					while (written < len) {
 						MemorySegment slice = buffer.asSlice(written);
 						int size = (int) (len - written);
-						int n = overlapped(handle, (state, ov) -> (int) WRITE_FILE.invokeExact(state, handle, slice,
+						int n = overlapped(handle, (state, ov) -> (int) WRITE_FILE.invokeExact(state, handle.value, slice,
 								size, MemorySegment.NULL, ov));
-						if (n < 0) {
-							open.set(false);
+						if (n <= 0) {
 							throw new IOException("WriteFile failed: " + -n);
 						}
 						written += n;
 					}
+				} catch (IOException e) {
+					PipeConnection.this.close();
+					throw e;
 				}
 			}
 		}

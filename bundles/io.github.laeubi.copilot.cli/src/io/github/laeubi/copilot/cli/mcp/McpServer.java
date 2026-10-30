@@ -26,9 +26,11 @@ import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -70,9 +72,11 @@ public class McpServer {
 	private final Path socketPath;
 	private final String pipeName;
 	private final McpToolHandler toolHandler;
+	private final ILog log;
 	private final AtomicBoolean running = new AtomicBoolean(false);
 	private final CopyOnWriteArrayList<SseClient> sseClients = new CopyOnWriteArrayList<>();
 	private final AtomicLong connectionCounter = new AtomicLong(0);
+	private final Set<Connection> connections = new HashSet<>();
 
 	private Listener listener;
 
@@ -84,10 +88,7 @@ public class McpServer {
 	 * @param toolHandler tool handler for MCP tool calls
 	 */
 	public McpServer(Path socketPath, String nonce, McpToolHandler toolHandler) {
-		this.socketPath = socketPath;
-		this.pipeName = null;
-		this.nonce = nonce;
-		this.toolHandler = toolHandler;
+		this(socketPath, null, nonce, toolHandler, ILog.get());
 	}
 
 	/**
@@ -98,57 +99,115 @@ public class McpServer {
 	 * @param toolHandler tool handler for MCP tool calls
 	 */
 	public McpServer(String pipeName, String nonce, McpToolHandler toolHandler) {
-		this.socketPath = null;
+		this(null, pipeName, nonce, toolHandler, ILog.get());
+	}
+
+	McpServer(Path socketPath, String pipeName, String nonce, McpToolHandler toolHandler, ILog log) {
+		this.socketPath = socketPath;
 		this.pipeName = pipeName;
 		this.nonce = nonce;
 		this.toolHandler = toolHandler;
+		this.log = log;
 	}
 
-	public void start() throws IOException {
+	public synchronized void start() throws IOException {
 		if (!running.compareAndSet(false, true)) {
 			return;
 		}
-		if (pipeName != null) {
-			listener = pipeListener(new NamedPipe(pipeName));
-			ILog.get().info("[MCP] Server listening on named pipe " + pipeName);
-		} else {
-			Files.deleteIfExists(socketPath);
-			ServerSocketChannel serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
-			serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
-			listener = socketListener(serverChannel);
-			ILog.get().info("[MCP] Server listening on Unix socket " + socketPath);
-		}
-
-		// Platform threads: blocking native pipe calls would pin virtual threads.
-		Thread.ofPlatform().daemon().name("MCP accept").start(() -> {
-			while (running.get()) {
+		try {
+			if (pipeName != null) {
+				listener = pipeListener(new NamedPipe(pipeName));
+				log.info("[MCP] Server listening on named pipe " + pipeName);
+			} else {
+				Files.deleteIfExists(socketPath);
+				ServerSocketChannel serverChannel = ServerSocketChannel.open(StandardProtocolFamily.UNIX);
 				try {
-					Connection client = listener.accept();
-					long connId = connectionCounter.incrementAndGet();
-					ILog.get().info("[MCP] Connection #" + connId + " accepted");
-					Thread.ofPlatform().daemon().name("MCP #" + connId)
-							.start(() -> handleConnection(client, connId));
-				} catch (IOException e) {
-					if (running.get()) {
-						ILog.get().error("[MCP] Error accepting connection: " + e.getMessage(), e);
+					serverChannel.bind(UnixDomainSocketAddress.of(socketPath));
+					listener = socketListener(serverChannel);
+				} catch (IOException | RuntimeException | Error e) {
+					try {
+						serverChannel.close();
+					} catch (IOException closeError) {
+						e.addSuppressed(closeError);
+					}
+					throw e;
+				}
+				log.info("[MCP] Server listening on Unix socket " + socketPath);
+			}
+
+			Listener accepting = listener;
+			// Platform threads: blocking native pipe calls would pin virtual threads.
+			Thread.ofPlatform().daemon().name("MCP accept").start(() -> {
+				while (running.get()) {
+					try {
+						Connection client = accepting.accept();
+						dispatchConnection(client, accepting);
+					} catch (IOException e) {
+						synchronized (this) {
+							if (running.get() && listener == accepting) {
+								log.error("[MCP] Error accepting connection: " + e.getMessage(), e);
+								stop();
+							}
+						}
+						return;
+					} catch (RuntimeException | Error e) {
+						stop();
+						throw e;
 					}
 				}
-			}
-		});
+			});
+		} catch (IOException | RuntimeException | Error e) {
+			stop();
+			throw e;
+		}
 	}
 
-	public void stop() {
+	private synchronized void dispatchConnection(Connection client, Listener accepting) {
+		if (!running.get() || listener != accepting) {
+			closeConnection(client);
+			return;
+		}
+		boolean dispatched = false;
+		try {
+			connections.add(client);
+			long connId = connectionCounter.incrementAndGet();
+			log.info("[MCP] Connection #" + connId + " accepted");
+			startConnectionThread(() -> handleConnection(client, connId), connId);
+			dispatched = true;
+		} finally {
+			if (!dispatched) {
+				connections.remove(client);
+				closeConnection(client);
+			}
+		}
+	}
+
+	void startConnectionThread(Runnable handler, long connId) {
+		Thread.ofPlatform().daemon().name("MCP #" + connId).start(handler);
+	}
+
+	private void closeConnection(Connection client) {
+		try {
+			client.close();
+		} catch (IOException e) {
+			log.warn("[MCP] Failed to close connection", e);
+		}
+	}
+
+	public synchronized void stop() {
 		if (!running.compareAndSet(true, false)) {
 			return;
 		}
-		ILog.get().info("[MCP] Server stopping...");
-		for (SseClient client : sseClients) {
-			client.close();
-		}
-		sseClients.clear();
+		log.info("[MCP] Server stopping...");
 		if (listener != null) {
 			listener.close();
+			listener = null;
 		}
+		for (Connection client : connections) {
+			closeConnection(client);
+		}
+		connections.clear();
+		sseClients.clear();
 		try {
 			if (socketPath != null) {
 				Files.deleteIfExists(socketPath);
@@ -156,7 +215,7 @@ public class McpServer {
 		} catch (IOException e) {
 			// ignore
 		}
-		ILog.get().info("[MCP] Server stopped");
+		log.info("[MCP] Server stopped");
 	}
 
 	public boolean isRunning() {
@@ -182,27 +241,36 @@ public class McpServer {
 			@Override
 			public Connection accept() throws IOException {
 				SocketChannel channel = serverChannel.accept();
-				return new Connection() {
-					@Override
-					public InputStream in() {
-						return Channels.newInputStream(channel);
-					}
+				boolean transferred = false;
+				try {
+					Connection connection = new Connection() {
+						@Override
+						public InputStream in() {
+							return Channels.newInputStream(channel);
+						}
 
-					@Override
-					public OutputStream out() {
-						return Channels.newOutputStream(channel);
-					}
+						@Override
+						public OutputStream out() {
+							return Channels.newOutputStream(channel);
+						}
 
-					@Override
-					public boolean isOpen() {
-						return channel.isOpen();
-					}
+						@Override
+						public boolean isOpen() {
+							return channel.isOpen();
+						}
 
-					@Override
-					public void close() throws IOException {
+						@Override
+						public void close() throws IOException {
+							channel.close();
+						}
+					};
+					transferred = true;
+					return connection;
+				} finally {
+					if (!transferred) {
 						channel.close();
 					}
-				};
+				}
 			}
 
 			@Override
@@ -226,7 +294,7 @@ public class McpServer {
 		notification.put("params", params);
 		String json = Json.serialize(notification);
 
-		ILog.get().info("[MCP] Pushing notification '" + method + "' to " + sseClients.size() + " SSE client(s)");
+		log.info("[MCP] Pushing notification '" + method + "' to " + sseClients.size() + " SSE client(s)");
 
 		List<SseClient> dead = new ArrayList<>();
 		for (SseClient client : sseClients) {
@@ -235,7 +303,7 @@ public class McpServer {
 			}
 		}
 		if (!dead.isEmpty()) {
-			ILog.get().info("[MCP] Removed " + dead.size() + " dead SSE client(s)");
+			log.info("[MCP] Removed " + dead.size() + " dead SSE client(s)");
 			sseClients.removeAll(dead);
 		}
 	}
@@ -254,7 +322,7 @@ public class McpServer {
 			while (running.get() && channel.isOpen()) {
 				String requestLine = reader.readLine();
 				if (requestLine == null) {
-					ILog.get().info(prefix + " Client closed connection (EOF) after " + requestCount + " request(s)");
+					log.info(prefix + " Client closed connection (EOF) after " + requestCount + " request(s)");
 					break;
 				}
 				if (requestLine.isBlank()) {
@@ -262,11 +330,11 @@ public class McpServer {
 				}
 
 				requestCount++;
-				ILog.get().info(prefix + " Request #" + requestCount + ": " + requestLine);
+				log.info(prefix + " Request #" + requestCount + ": " + requestLine);
 
 				String[] parts = requestLine.split(" ");
 				if (parts.length < 3) {
-					ILog.get().warn(prefix + " Malformed request line: " + requestLine);
+					log.warn(prefix + " Malformed request line: " + requestLine);
 					break;
 				}
 				String httpMethod = parts[0];
@@ -283,19 +351,19 @@ public class McpServer {
 						headers.put(key, value);
 					}
 				}
-				ILog.get().info(prefix + " Headers: " + headers);
+				log.info(prefix + " Headers: " + headers);
 
 				// Validate nonce
 				String auth = headers.get("authorization");
 				if (auth == null || !auth.equals("Nonce " + nonce)) {
-					ILog.get().warn(prefix + " Auth failed, expected nonce but got: " + auth);
+					log.warn(prefix + " Auth failed, expected nonce but got: " + auth);
 					sendResponse(os, 401, "Unauthorized", "text/plain", "Unauthorized", prefix);
 					break;
 				}
 
 				// Only handle /mcp and /
 				if (!"/mcp".equals(path) && !"/".equals(path)) {
-					ILog.get().warn(prefix + " Unknown path: " + path);
+					log.warn(prefix + " Unknown path: " + path);
 					sendResponse(os, 404, "Not Found", "text/plain", "Not Found", prefix);
 					break;
 				}
@@ -313,7 +381,7 @@ public class McpServer {
 					return;
 				}
 				default -> {
-					ILog.get().warn(prefix + " Unsupported HTTP method: " + httpMethod);
+					log.warn(prefix + " Unsupported HTTP method: " + httpMethod);
 					sendResponse(os, 405, "Method Not Allowed", "text/plain", "Method Not Allowed", prefix);
 					break;
 				}
@@ -322,16 +390,20 @@ public class McpServer {
 				// Check if client requested connection close
 				String conn = headers.get("connection");
 				if (conn != null && conn.equalsIgnoreCase("close")) {
-					ILog.get().info(prefix + " Client requested Connection: close");
+					log.info(prefix + " Client requested Connection: close");
 					break;
 				}
 			}
 		} catch (IOException e) {
 			if (running.get()) {
-				ILog.get().warn(prefix + " Connection error after " + requestCount + " request(s): " + e.getMessage());
+				log.warn(prefix + " Connection error after " + requestCount + " request(s): " + e.getMessage());
+			}
+		} finally {
+			synchronized (this) {
+				connections.remove(channel);
 			}
 		}
-		ILog.get().info(prefix + " Connection closed, handled " + requestCount + " request(s)");
+		log.info(prefix + " Connection closed, handled " + requestCount + " request(s)");
 	}
 
 	private void handlePost(BufferedReader reader, Map<String, String> headers, OutputStream os, String prefix)
@@ -340,7 +412,7 @@ public class McpServer {
 		String jsonBody;
 		String te = headers.get("transfer-encoding");
 		if (te != null && te.toLowerCase().contains("chunked")) {
-			ILog.get().info(prefix + " Reading chunked body...");
+			log.info(prefix + " Reading chunked body...");
 			jsonBody = readChunkedBody(reader);
 		} else {
 			int contentLength = 0;
@@ -348,7 +420,7 @@ public class McpServer {
 			if (clHeader != null) {
 				contentLength = Integer.parseInt(clHeader.trim());
 			}
-			ILog.get().info(prefix + " Reading body, Content-Length=" + contentLength);
+			log.info(prefix + " Reading body, Content-Length=" + contentLength);
 			char[] body = new char[contentLength];
 			int read = 0;
 			while (read < contentLength) {
@@ -360,11 +432,11 @@ public class McpServer {
 			jsonBody = new String(body, 0, read);
 		}
 
-		ILog.get().info(prefix + " Body (" + jsonBody.length() + " chars): " + truncate(jsonBody, 500));
+		log.info(prefix + " Body (" + jsonBody.length() + " chars): " + truncate(jsonBody, 500));
 
 		Map<String, Object> request = Json.parseObject(jsonBody);
 		if (request == null) {
-			ILog.get().warn(prefix + " Failed to parse JSON body");
+			log.warn(prefix + " Failed to parse JSON body");
 			sendResponse(os, 400, "Bad Request", "text/plain", "Invalid JSON", prefix);
 			return;
 		}
@@ -372,11 +444,11 @@ public class McpServer {
 		String method = (String) request.get("method");
 		Object id = request.get("id");
 
-		ILog.get().info(prefix + " JSON-RPC method='" + method + "' id=" + id);
+		log.info(prefix + " JSON-RPC method='" + method + "' id=" + id);
 
 		// Notification (no id) → 202 Accepted
 		if (id == null) {
-			ILog.get().info(prefix + " Notification '" + method + "' → 202 Accepted");
+			log.info(prefix + " Notification '" + method + "' → 202 Accepted");
 			sendResponse(os, 202, "Accepted", "text/plain", "", prefix);
 			return;
 		}
@@ -402,7 +474,7 @@ public class McpServer {
 			sessionId = "vs-" + UUID.randomUUID().toString();
 		}
 
-		ILog.get().info(prefix + " Response (" + responseJson.length() + " chars): " + truncate(responseJson, 500));
+		log.info(prefix + " Response (" + responseJson.length() + " chars): " + truncate(responseJson, 500));
 
 		// Send as SSE event
 		String ssePayload = "event: message\ndata: " + responseJson + "\n\n";
@@ -416,7 +488,7 @@ public class McpServer {
 			sessionId = "vs-" + UUID.randomUUID().toString();
 		}
 
-		ILog.get().info(prefix + " Opening SSE stream, sessionId=" + sessionId);
+		log.info(prefix + " Opening SSE stream, sessionId=" + sessionId);
 
 		// Send SSE headers
 		String httpHeaders = "HTTP/1.1 200 OK\r\n" + "Content-Type: text/event-stream\r\n"
@@ -428,7 +500,7 @@ public class McpServer {
 		// Register as SSE client
 		SseClient client = new SseClient(os, channel, prefix);
 		sseClients.add(client);
-		ILog.get().info(prefix + " SSE client registered, total=" + sseClients.size());
+		log.info(prefix + " SSE client registered, total=" + sseClients.size());
 
 		// Keep the connection alive until closed
 		try {
@@ -439,12 +511,12 @@ public class McpServer {
 			Thread.currentThread().interrupt();
 		} finally {
 			sseClients.remove(client);
-			ILog.get().info(prefix + " SSE client removed, remaining=" + sseClients.size());
+			log.info(prefix + " SSE client removed, remaining=" + sseClients.size());
 		}
 	}
 
 	private void handleDelete(Map<String, String> headers, OutputStream os, String prefix) throws IOException {
-		ILog.get().info(prefix + " DELETE → session terminated");
+		log.info(prefix + " DELETE → session terminated");
 		sendResponse(os, 200, "OK", "text/plain", "", prefix);
 	}
 
@@ -457,7 +529,7 @@ public class McpServer {
 			params = Map.of();
 		}
 
-		ILog.get().info(prefix + " Dispatching method='" + method + "'");
+		log.info(prefix + " Dispatching method='" + method + "'");
 		long start = System.currentTimeMillis();
 
 		Map<String, Object> result = switch (method) {
@@ -466,7 +538,7 @@ public class McpServer {
 		case "tools/call" -> handleToolsCall(params, prefix);
 		case "ping" -> Map.of("result", Map.of());
 		default -> {
-			ILog.get().warn(prefix + " Unknown method: " + method);
+			log.warn(prefix + " Unknown method: " + method);
 			Map<String, Object> error = new LinkedHashMap<>();
 			error.put("error", Map.of("code", -32601, "message", "Method not found: " + method));
 			yield error;
@@ -474,7 +546,7 @@ public class McpServer {
 		};
 
 		long elapsed = System.currentTimeMillis() - start;
-		ILog.get().info(prefix + " Method '" + method + "' completed in " + elapsed + "ms");
+		log.info(prefix + " Method '" + method + "' completed in " + elapsed + "ms");
 		return result;
 	}
 
@@ -574,7 +646,7 @@ public class McpServer {
 			arguments = Map.of();
 		}
 
-		ILog.get().info(prefix + " Tool call: " + name + " args=" + truncate(Json.serialize(arguments), 200));
+		log.info(prefix + " Tool call: " + name + " args=" + truncate(Json.serialize(arguments), 200));
 
 		try {
 			Object result = toolHandler.callTool(name, arguments);
@@ -587,7 +659,7 @@ public class McpServer {
 				text = String.valueOf(result);
 			}
 
-			ILog.get().info(prefix + " Tool '" + name + "' result (" + text.length() + " chars): " + truncate(text, 300));
+			log.info(prefix + " Tool '" + name + "' result (" + text.length() + " chars): " + truncate(text, 300));
 
 			Map<String, Object> content = new LinkedHashMap<>();
 			content.put("type", "text");
@@ -595,7 +667,7 @@ public class McpServer {
 
 			return Map.of("result", Map.of("content", List.of(content), "isError", false));
 		} catch (Exception e) {
-			ILog.get().error(prefix + " Tool '" + name + "' error: " + e.getMessage(), e);
+			log.error(prefix + " Tool '" + name + "' error: " + e.getMessage(), e);
 			Map<String, Object> content = new LinkedHashMap<>();
 			content.put("type", "text");
 			content.put("text", "Error: " + e.getMessage());
@@ -664,7 +736,7 @@ public class McpServer {
 		byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
 		String response = "HTTP/1.1 " + status + " " + statusText + "\r\n" + "Content-Type: " + contentType + "\r\n"
 				+ "Content-Length: " + bodyBytes.length + "\r\n" + "\r\n";
-		ILog.get().info(prefix + " → HTTP " + status + " " + statusText + " (" + bodyBytes.length + " bytes)");
+		log.info(prefix + " → HTTP " + status + " " + statusText + " (" + bodyBytes.length + " bytes)");
 		os.write(response.getBytes(StandardCharsets.UTF_8));
 		os.write(bodyBytes);
 		os.flush();
@@ -675,7 +747,7 @@ public class McpServer {
 		byte[] payloadBytes = ssePayload.getBytes(StandardCharsets.UTF_8);
 		String headers = "HTTP/1.1 " + status + " OK\r\n" + "Content-Type: text/event-stream\r\n" + "Mcp-Session-Id: "
 				+ sessionId + "\r\n" + "Content-Length: " + payloadBytes.length + "\r\n" + "\r\n";
-		ILog.get().info(prefix + " → SSE HTTP " + status + " sessionId=" + sessionId + " (" + payloadBytes.length
+		log.info(prefix + " → SSE HTTP " + status + " sessionId=" + sessionId + " (" + payloadBytes.length
 				+ " bytes)");
 		os.write(headers.getBytes(StandardCharsets.UTF_8));
 		os.write(payloadBytes);
@@ -690,7 +762,7 @@ public class McpServer {
 
 	// --- SSE client wrapper ---
 
-	static class SseClient {
+	class SseClient {
 		private final OutputStream os;
 		private final Connection channel;
 		private final String prefix;
@@ -713,10 +785,10 @@ public class McpServer {
 				os.write(data);
 				os.write("\r\n".getBytes(StandardCharsets.UTF_8));
 				os.flush();
-				ILog.get().info(prefix + " SSE push sent (" + data.length + " bytes)");
+				log.info(prefix + " SSE push sent (" + data.length + " bytes)");
 				return true;
 			} catch (IOException e) {
-				ILog.get().info(prefix + " SSE push failed (client disconnected): " + e.getMessage());
+				log.info(prefix + " SSE push failed (client disconnected): " + e.getMessage());
 				alive = false;
 				return false;
 			}

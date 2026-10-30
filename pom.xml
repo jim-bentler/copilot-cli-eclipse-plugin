@@ -21,6 +21,7 @@
 	</properties>
 
 	<modules>
+		<module>transport-tests</module>
 		<module>bundles/io.github.laeubi.copilot.cli</module>
 		<module>features/io.github.laeubi.copilot.cli.feature</module>
 		<module>releng/io.github.laeubi.copilot.cli.repository</module>

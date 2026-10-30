@@ -64,7 +64,7 @@ If the command is not found, please install the GitHub Copilot CLI following the
 ### Prerequisites for Building
 
 - Maven 3.9.x or higher
-- JDK 21 or higher
+- JDK 22 or higher
 
 ### Build Instructions
 
@@ -88,6 +88,22 @@ If the command is not found, please install the GitHub Copilot CLI following the
    ```
    releng/io.github.laeubi.copilot.cli.repository/target/io.github.laeubi.copilot.cli.repository-*.zip
    ```
+
+### Transport Regression Tests
+
+`mvn clean verify` includes the standalone transport tests. To run only those tests:
+
+```bash
+mvn -f transport-tests/pom.xml test
+```
+
+They exercise connection cleanup on failure and shutdown without launching Eclipse.
+Windows runs the native named-pipe tests; Linux/macOS run the Unix socket bind-failure
+test. CI runs both the Linux build and a Windows transport-test job.
+
+The server cancels outstanding pipe operations on close, retaining each native
+buffer and pipe handle until its operations complete. Shutdown closes all accepted
+connections, including idle clients and partially received requests.
 
 ## Development Setup
 
@@ -143,4 +159,3 @@ This project is licensed under the Eclipse Public License 2.0 - see the [LICENSE
 ## Support
 
 For issues, questions, or contributions, please use the [GitHub Issues](https://github.com/laeubi/copilot-cli-eclipse-plugin/issues) page.
-

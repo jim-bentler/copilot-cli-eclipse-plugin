@@ -6,7 +6,10 @@
 mvn clean verify
 ```
 
-Requires JDK 21+ and Maven 3.9+. The build uses **Tycho 5.0.2** to compile Eclipse plugins against p2 repositories (Eclipse 2025-12 release). There are no tests or linters configured. The build output is a p2 update site at `releng/io.github.laeubi.copilot.cli.repository/target/repository/`.
+Requires JDK 22+ and Maven 3.9+. The build uses **Tycho 5.0.2** to compile Eclipse plugins against p2
+repositories (Eclipse 2025-12 release). Transport regression tests run as part of the build, or
+independently with `mvn -f transport-tests/pom.xml test`. There are no linters configured. The build
+output is a p2 update site at `releng/io.github.laeubi.copilot.cli.repository/target/repository/`.
 
 ## Architecture
 
@@ -16,6 +19,9 @@ This is an Eclipse IDE plugin that integrates GitHub Copilot CLI into the Eclips
 - `features/io.github.laeubi.copilot.cli.feature` — feature for p2 installation (packaging: `eclipse-feature`)
 - `releng/io.github.laeubi.copilot.cli.repository` — p2 update site (packaging: `eclipse-repository`)
 - `ide-cli-test` — standalone CLI test tool for MCP protocol testing (plain Maven JAR, not Tycho)
+- `transport-tests` — standalone JUnit transport lifecycle tests; compiles the transport
+  sources directly and supplies an `ILog` test double because Eclipse's default logger
+  requires OSGi
 
 The plugin has Java classes organized into four packages under `io.github.laeubi.copilot.cli`:
 
